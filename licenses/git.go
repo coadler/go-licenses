@@ -50,6 +50,7 @@ func FindGitRepo(filePath string) (*GitRepo, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return &GitRepo{dotGitPath: path}, nil
 }
 

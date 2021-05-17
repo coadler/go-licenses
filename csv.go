@@ -20,8 +20,8 @@ import (
 	"os"
 	"strings"
 
+	"github.com/coadler/go-licenses/licenses"
 	"github.com/golang/glog"
-	"github.com/google/go-licenses/licenses"
 	"github.com/spf13/cobra"
 )
 
@@ -54,6 +54,7 @@ func csvMain(_ *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+
 	for _, lib := range libs {
 		licenseURL := "Unknown"
 		licenseName := "Unknown"

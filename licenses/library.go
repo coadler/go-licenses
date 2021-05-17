@@ -16,8 +16,11 @@ package licenses
 
 import (
 	"context"
+	"encoding/xml"
 	"fmt"
 	"go/build"
+	"io"
+	"net/http"
 	"net/url"
 	"path"
 	"path/filepath"
@@ -31,8 +34,9 @@ import (
 var (
 	// TODO(RJPercival): Support replacing "master" with Go Module version
 	repoPathPrefixes = map[string]string{
-		"github.com":    "blob/master/",
-		"bitbucket.org": "src/master/",
+		"github.com":          "blob/master/",
+		"bitbucket.org":       "src/master/",
+		"go.googlesource.com": "+/refs/heads/master/",
 	}
 )
 
@@ -177,22 +181,61 @@ func (l *Library) FileURL(filePath string) (*url.URL, error) {
 	if err != nil {
 		return nil, err
 	}
-	nameParts := strings.SplitN(l.Name(), "/", 4)
-	if len(nameParts) < 3 {
-		return nil, fmt.Errorf("cannot determine URL for %q package", l.Name())
+
+	lurl, err := url.Parse(l.Name())
+	if err != nil {
+		return nil, err
 	}
-	host, user, project := nameParts[0], nameParts[1], nameParts[2]
+
+	lurl.Scheme = "https"
+	q := lurl.Query()
+	q.Add("go-get", "1")
+	lurl.RawQuery = q.Encode()
+
+	imps, err := repoFromVanityURL(lurl.String())
+	if err != nil {
+		return nil, err
+	}
+
+	if len(imps) != 1 {
+		nameParts := strings.SplitN(l.Name(), "/", 4)
+		if len(nameParts) < 3 {
+			return nil, fmt.Errorf("cannot determine URL for %q package", l.Name())
+		}
+		host, user, project := nameParts[0], nameParts[1], nameParts[2]
+		pathPrefix, ok := repoPathPrefixes[host]
+		if !ok {
+			return nil, fmt.Errorf("unsupported package host %q for %q", host, l.Name())
+		}
+		if len(nameParts) == 4 {
+			pathPrefix = path.Join(pathPrefix, nameParts[3])
+		}
+
+		return &url.URL{
+			Scheme: "https",
+			Host:   host,
+			Path:   path.Join(user, project, pathPrefix, relFilePath),
+		}, nil
+	}
+
+	nameParts := strings.SplitN(strings.TrimPrefix(imps[0].RepoRoot, "https://"), "/", 2)
+	if len(nameParts) < 2 {
+		return nil, fmt.Errorf("cannot determine URL for %q package", imps[0].RepoRoot)
+	}
+
+	host := nameParts[0]
 	pathPrefix, ok := repoPathPrefixes[host]
 	if !ok {
-		return nil, fmt.Errorf("unsupported package host %q for %q", host, l.Name())
+		return nil, fmt.Errorf("unsupported package host %q for %q", host, imps[0].RepoRoot)
 	}
 	if len(nameParts) == 4 {
 		pathPrefix = path.Join(pathPrefix, nameParts[3])
 	}
+
 	return &url.URL{
 		Scheme: "https",
 		Host:   host,
-		Path:   path.Join(user, project, pathPrefix, relFilePath),
+		Path:   path.Join(nameParts[1], pathPrefix, relFilePath),
 	}, nil
 }
 
@@ -202,4 +245,103 @@ func isStdLib(pkg *packages.Package) bool {
 		return false
 	}
 	return strings.HasPrefix(pkg.GoFiles[0], build.Default.GOROOT)
+}
+
+func repoFromVanityURL(url string) ([]metaImport, error) {
+	res, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+
+	defer res.Body.Close()
+	return parseMetaGoImports(res.Body, true)
+}
+
+type metaImport struct {
+	Prefix, VCS, RepoRoot string
+}
+
+// charsetReader returns a reader for the given charset. Currently
+// it only supports UTF-8 and ASCII. Otherwise, it returns a meaningful
+// error which is printed by go get, so the user can find why the package
+// wasn't downloaded if the encoding is not supported. Note that, in
+// order to reduce potential errors, ASCII is treated as UTF-8 (i.e. characters
+// greater than 0x7f are not rejected).
+func charsetReader(charset string, input io.Reader) (io.Reader, error) {
+	switch strings.ToLower(charset) {
+	case "ascii":
+		return input, nil
+	default:
+		return nil, fmt.Errorf("can't decode XML document using charset %q", charset)
+	}
+}
+
+// parseMetaGoImports returns meta imports from the HTML in r.
+// Parsing ends at the end of the <head> section or the beginning of the <body>.
+func parseMetaGoImports(r io.Reader, preferMod bool) (imports []metaImport, err error) {
+	d := xml.NewDecoder(r)
+	d.CharsetReader = charsetReader
+	d.Strict = false
+	var t xml.Token
+	for {
+		t, err = d.RawToken()
+		if err != nil {
+			if err == io.EOF || len(imports) > 0 {
+				err = nil
+			}
+			break
+		}
+		if e, ok := t.(xml.StartElement); ok && strings.EqualFold(e.Name.Local, "body") {
+			break
+		}
+		if e, ok := t.(xml.EndElement); ok && strings.EqualFold(e.Name.Local, "head") {
+			break
+		}
+		e, ok := t.(xml.StartElement)
+		if !ok || !strings.EqualFold(e.Name.Local, "meta") {
+			continue
+		}
+		if attrValue(e.Attr, "name") != "go-import" {
+			continue
+		}
+		if f := strings.Fields(attrValue(e.Attr, "content")); len(f) == 3 {
+			imports = append(imports, metaImport{
+				Prefix:   f[0],
+				VCS:      f[1],
+				RepoRoot: f[2],
+			})
+		}
+	}
+
+	// Extract mod entries if we are paying attention to them.
+	var list []metaImport
+	var have map[string]bool
+	if preferMod {
+		have = make(map[string]bool)
+		for _, m := range imports {
+			if m.VCS == "mod" {
+				have[m.Prefix] = true
+				list = append(list, m)
+			}
+		}
+	}
+
+	// Append non-mod entries, ignoring those superseded by a mod entry.
+	for _, m := range imports {
+		if m.VCS != "mod" && !have[m.Prefix] {
+			list = append(list, m)
+		}
+	}
+	return list, nil
+}
+
+// attrValue returns the attribute value for the case-insensitive key
+// `name', or the empty string if nothing is found.
+func attrValue(attrs []xml.Attr, name string) string {
+	for _, a := range attrs {
+		if strings.EqualFold(a.Name.Local, name) {
+			return a.Value
+		}
+	}
+	return ""
 }
