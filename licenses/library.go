@@ -218,7 +218,8 @@ func (l *Library) FileURL(filePath string) (*url.URL, error) {
 		}, nil
 	}
 
-	nameParts := strings.SplitN(strings.TrimPrefix(imps[0].RepoRoot, "https://"), "/", 2)
+	name := strings.TrimSuffix(strings.TrimPrefix(imps[0].RepoRoot, "https://"), ".git")
+	nameParts := strings.SplitN(name, "/", 2)
 	if len(nameParts) < 2 {
 		return nil, fmt.Errorf("cannot determine URL for %q package", imps[0].RepoRoot)
 	}
